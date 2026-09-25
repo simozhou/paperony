@@ -14,7 +14,8 @@ Usage
 
 Optional environment variables
     NCBI_API_KEY   free key from your NCBI account; raises the rate limit 3 -> 10 req/s
-    NCBI_EMAIL     contact address NCBI asks tools to send
+    NCBI_EMAIL     contact address NCBI asks tools to send (also sent to Crossref)
+    CROSSREF_MAILTO  optional separate contact address for Crossref
 
 Requires: Python 3.8+, requests  (pip install requests)
 """
@@ -98,6 +99,8 @@ THEMES = {
 
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
 BIORXIV_API = "https://api.biorxiv.org/details/biorxiv"
+EUROPEPMC = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+CROSSREF = "https://api.crossref.org/works"
 USER_AGENT = "weekly-lit-fetch/1.0 (personal literature digest)"
 
 # ----------------------------------------------------------------------------- helpers
@@ -331,17 +334,34 @@ def parse_jats_last_author(xml_bytes):
     return {"name": name, "affiliations": aff_list}
 
 
-def _surname(biorxiv_name):
-    # bioRxiv author strings look like "Smith, J. A."
-    return biorxiv_name.split(",")[0].strip().lower()
+def _surname(name):
+    # bioRxiv names look like "Smith, J. A."; Europe PMC names like "Smith JA"
+    name = name.strip()
+    if "," in name:
+        return name.split(",")[0].strip().lower()
+    return name.split(" ")[0].strip().lower() if name else ""
 
 
-def fetch_preprints(session, start, end, min_core, min_extended, use_jats=True):
-    log(f"bioRxiv: fetching preprints posted {start} to {end}")
+def _get_json(session, url, params=None, tries=4):
+    """GET and parse JSON; retries when the server returns a non-JSON page (e.g. a bot check)."""
+    for i in range(tries):
+        r = http_request(session, "GET", url, params=params)
+        try:
+            return r.json()
+        except ValueError:
+            snippet = " ".join(r.text[:200].split())
+            log(f"    non-JSON response (HTTP {r.status_code}, {r.headers.get('content-type', '?')}): "
+                f"{snippet or '<empty body>'}")
+            if i == tries - 1:
+                raise
+            time.sleep(5 * (i + 1))
+
+
+def _biorxiv_candidates(session, start, end):
     raw, cursor, total = [], 0, None
     while True:
         url = f"{BIORXIV_API}/{start:%Y-%m-%d}/{end:%Y-%m-%d}/{cursor}/json"
-        data = http_request(session, "GET", url).json()
+        data = _get_json(session, url)
         coll = data.get("collection", []) or []
         if total is None:
             try:
@@ -355,80 +375,274 @@ def fetch_preprints(session, start, end, min_core, min_extended, use_jats=True):
             break
         time.sleep(0.5)
 
-    stats = {"biorxiv_records": len(raw), "new_v1": 0, "kept": 0, "per_category": {}}
-    kept = {}
+    out = []
     for p in raw:
         if str(p.get("version", "")) != "1":
             continue
-        stats["new_v1"] += 1
-        cat = (p.get("category") or "").strip().lower()
-        title, abstract = clean(p.get("title")), clean(p.get("abstract"))
-        rel = relevance(title + " " + abstract)
-        if cat in BIORXIV_CORE:
-            if rel["n_themes"] < min_core:
-                continue
-        elif cat in BIORXIV_EXTENDED:
-            if rel["n_themes"] < min_extended:
-                continue
-        else:
-            continue
-
         authors = [a.strip() for a in (p.get("authors") or "").split(";") if a.strip()]
-        doi = p.get("doi", "")
         published = p.get("published")
-        kept[doi] = {
-            "source": "preprint",
-            "journal": "bioRxiv",
-            "category": cat,
-            "article_type": p.get("type", "") or "Preprint",
-            "title": title,
-            "abstract": abstract,
+        out.append({
+            "doi": p.get("doi", ""),
+            "title": clean(p.get("title")),
+            "abstract": clean(p.get("abstract")),
             "date": p.get("date", ""),
-            "doi": doi,
-            "url": f"https://doi.org/{doi}" if doi else "",
-            "first_author": authors[0] if authors else "",
-            "last_author": {"name": authors[-1] if authors else "", "affiliations": [],
-                            "affiliation_source": None},
-            "n_authors": len(authors),
+            "category": (p.get("category") or "").strip().lower(),
+            "authors": authors,
+            "last_author_affiliations": [],
+            "affiliation_source": None,
             "corresponding_author": p.get("author_corresponding", ""),
             "corresponding_institution": p.get("author_corresponding_institution", ""),
             "published_in": published if published and published != "NA" else None,
+            "jats": p.get("jatsxml"),
+        })
+    return out
+
+
+def _europepmc_candidates(session, start, end):
+    query = (f'SRC:PPR AND PUBLISHER:"bioRxiv" AND '
+             f'FIRST_PDATE:[{start:%Y-%m-%d} TO {end:%Y-%m-%d}]')
+    params = {"query": query, "resultType": "core", "format": "json",
+              "pageSize": "1000", "cursorMark": "*"}
+    raw = []
+    while True:
+        data = _get_json(session, EUROPEPMC, params=params)
+        if not raw:
+            log(f"  {data.get('hitCount', '?')} bioRxiv preprints in Europe PMC")
+        results = (data.get("resultList") or {}).get("result", []) or []
+        raw.extend(results)
+        nxt = data.get("nextCursorMark")
+        if not results or not nxt or nxt == params["cursorMark"]:
+            break
+        params["cursorMark"] = nxt
+        time.sleep(0.3)
+
+    out = []
+    for p in raw:
+        publisher = ((p.get("bookOrReportDetails") or {}).get("publisher") or "").lower()
+        if publisher and "biorxiv" not in publisher:
+            continue
+        authors, last_affs = [], []
+        alist = (p.get("authorList") or {}).get("author", []) or []
+        for a in alist:
+            authors.append(a.get("fullName") or a.get("collectiveName") or "")
+        if alist:
+            details = (alist[-1].get("authorAffiliationDetailsList") or {}).get("authorAffiliation", []) or []
+            last_affs = [d.get("affiliation", "") for d in details if d.get("affiliation")]
+            if not last_affs and alist[-1].get("affiliation"):
+                last_affs = [alist[-1]["affiliation"]]
+        out.append({
+            "doi": p.get("doi", ""),
+            "title": clean(p.get("title")),
+            "abstract": clean(p.get("abstractText")),
+            "date": p.get("firstPublicationDate", ""),
+            "category": None,  # Europe PMC doesn't carry bioRxiv subject categories
+            "authors": authors,
+            "last_author_affiliations": last_affs,
+            "affiliation_source": "Europe PMC" if last_affs else None,
+            "corresponding_author": "",
+            "corresponding_institution": "",
+            "published_in": None,
+            "jats": None,
+        })
+    return out
+
+
+def _jats_abstract(s):
+    txt = clean(s)
+    return re.sub(r"^(Abstract|Summary)\s*[:.]?\s+", "", txt, flags=re.I)
+
+
+def _crossref_candidates(session, start, end):
+    """bioRxiv preprints via Crossref. bioRxiv registers each preprint's DOI there once, at
+    first posting, so filtering on the DOI creation date gives new preprints, not revisions."""
+    params = {
+        "filter": (f"prefix:10.1101,type:posted-content,"
+                   f"from-created-date:{start:%Y-%m-%d},until-created-date:{end:%Y-%m-%d}"),
+        "select": "DOI,title,abstract,author,posted,created,group-title,institution,relation",
+        "rows": "1000",
+        "cursor": "*",
+    }
+    mailto = os.environ.get("CROSSREF_MAILTO") or os.environ.get("NCBI_EMAIL")
+    if mailto:
+        params["mailto"] = mailto  # puts requests in Crossref's faster "polite" pool
+    items, total = [], None
+    while True:
+        msg = _get_json(session, CROSSREF, params=params).get("message", {})
+        if total is None:
+            total = msg.get("total-results", 0)
+            log(f"  {total} Crossref records with the bioRxiv/medRxiv DOI prefix")
+        batch = msg.get("items", []) or []
+        items.extend(batch)
+        nxt = msg.get("next-cursor")
+        if not batch or not nxt or len(items) >= total:
+            break
+        params["cursor"] = nxt
+        time.sleep(0.3)
+
+    out = []
+    for p in items:
+        servers = " ".join(i.get("name", "") for i in (p.get("institution") or [])).lower()
+        if "medrxiv" in servers:
+            continue
+        authors, last_affs = [], []
+        for a in p.get("author", []) or []:
+            name = " ".join(x for x in (a.get("given", ""), a.get("family", "")) if x) or a.get("name", "")
+            authors.append(name)
+        if p.get("author"):
+            last_affs = [x.get("name", "") for x in (p["author"][-1].get("affiliation") or []) if x.get("name")]
+        try:
+            y, m, d = (p.get("posted") or p.get("created"))["date-parts"][0][:3]
+            date = f"{y}-{m:02d}-{d:02d}"
+        except (TypeError, KeyError, ValueError, IndexError):
+            date = ""
+        published = [r.get("id") for r in (p.get("relation") or {}).get("is-preprint-of", []) if r.get("id")]
+        group = p.get("group-title")
+        out.append({
+            "doi": p.get("DOI", ""),
+            "title": clean(" ".join(p.get("title") or [])),
+            "abstract": _jats_abstract(p.get("abstract", "")),
+            "date": date,
+            "category": group.strip().lower() if group else None,
+            "authors": authors,
+            "last_author_affiliations": last_affs,
+            "affiliation_source": "Crossref" if last_affs else None,
+            "corresponding_author": "",
+            "corresponding_institution": "",
+            "published_in": published[0] if published else None,
+            "jats": None,
+        })
+    return out
+
+
+def _europepmc_affiliations(session, dois):
+    """Look up last-author affiliations in Europe PMC by DOI, in batches. Returns {doi: [affs]}."""
+    found = {}
+    for i in range(0, len(dois), 40):
+        chunk = dois[i:i + 40]
+        query = " OR ".join(f'DOI:"{d}"' for d in chunk)
+        try:
+            data = _get_json(session, EUROPEPMC, params={"query": query, "resultType": "core",
+                                                          "format": "json", "pageSize": "100"}, tries=2)
+        except (requests.RequestException, ValueError) as e:
+            log(f"    Europe PMC affiliation lookup failed: {e}")
+            break
+        for p in (data.get("resultList") or {}).get("result", []) or []:
+            alist = (p.get("authorList") or {}).get("author", []) or []
+            if not alist or not p.get("doi"):
+                continue
+            det = (alist[-1].get("authorAffiliationDetailsList") or {}).get("authorAffiliation", []) or []
+            affs = [d.get("affiliation", "") for d in det if d.get("affiliation")]
+            if not affs and alist[-1].get("affiliation"):
+                affs = [alist[-1]["affiliation"]]
+            if affs:
+                found[p["doi"].lower()] = affs
+        time.sleep(0.3)
+    return found
+
+
+def fetch_preprints(session, start, end, min_core, min_extended, min_uncategorised, use_jats=True):
+    log(f"Preprints: bioRxiv postings {start} to {end}")
+    stats = {"source": None, "candidates": 0, "kept": 0, "per_category": {}, "errors": []}
+    candidates = None
+    for name, fn in (("bioRxiv API", _biorxiv_candidates), ("Crossref", _crossref_candidates),
+                     ("Europe PMC", _europepmc_candidates)):
+        try:
+            log(f"  trying {name}")
+            candidates = fn(session, start, end)
+            stats["source"] = name
+            break
+        except (requests.RequestException, ValueError) as e:
+            msg = f"{name} failed: {type(e).__name__}: {str(e)[:200]}"
+            log("  " + msg)
+            stats["errors"].append(msg)
+    if candidates is None:
+        log("  no preprint source reachable; continuing without preprints")
+        return [], stats
+    stats["candidates"] = len(candidates)
+
+    kept = {}
+    for c in candidates:
+        rel = relevance(c["title"] + " " + c["abstract"])
+        cat = c["category"]
+        if cat is None:
+            threshold = min_uncategorised
+        elif cat in BIORXIV_CORE:
+            threshold = min_core
+        elif cat in BIORXIV_EXTENDED:
+            threshold = min_extended
+        else:
+            continue
+        if rel["n_themes"] < threshold or not c["doi"]:
+            continue
+        a = c["authors"]
+        kept[c["doi"]] = {
+            "source": "preprint",
+            "journal": "bioRxiv",
+            "category": cat,
+            "article_type": "Preprint",
+            "title": c["title"],
+            "abstract": c["abstract"],
+            "date": c["date"],
+            "doi": c["doi"],
+            "url": f"https://doi.org/{c['doi']}",
+            "first_author": a[0] if a else "",
+            "last_author": {"name": a[-1] if a else "", "affiliations": c["last_author_affiliations"],
+                            "affiliation_source": c["affiliation_source"]},
+            "n_authors": len(a),
+            "corresponding_author": c["corresponding_author"],
+            "corresponding_institution": c["corresponding_institution"],
+            "published_in": c["published_in"],
             "relevance": rel,
-            "_jats": p.get("jatsxml"),
+            "_jats": c["jats"],
         }
-        stats["per_category"][cat] = stats["per_category"].get(cat, 0) + 1
+        key = cat or "unknown category"
+        stats["per_category"][key] = stats["per_category"].get(key, 0) + 1
 
     records = list(kept.values())
-    log(f"  kept {len(records)} relevant new preprints (of {stats['new_v1']} new v1 preprints)")
+    log(f"  kept {len(records)} relevant preprints (of {len(candidates)} new preprints)")
 
-    # Last-author affiliation: bioRxiv's API only gives the corresponding author's institution,
-    # so try the full-text JATS XML (best effort), then fall back to the corresponding author.
-    jats_ok = use_jats
-    for n, rec in enumerate(records, 1):
+    # Last-author affiliations, in order of preference for papers still missing one:
+    # the source's own data (above), Europe PMC by DOI, the full-text XML on biorxiv.org,
+    # and finally the corresponding author's institution when they are the last author.
+    missing = [r["doi"] for r in records if not r["last_author"]["affiliations"]]
+    if missing:
+        log(f"  looking up {len(missing)} last-author affiliations in Europe PMC")
+        epmc = _europepmc_affiliations(session, missing)
+        for rec in records:
+            affs = epmc.get(rec["doi"].lower())
+            if affs and not rec["last_author"]["affiliations"]:
+                rec["last_author"]["affiliations"] = affs
+                rec["last_author"]["affiliation_source"] = "Europe PMC"
+
+    jats_ok, jats_failures = use_jats, 0
+    for rec in records:
         jats_url = rec.pop("_jats", None)
         la = rec["last_author"]
+        if la["affiliations"]:
+            continue
         if jats_ok and jats_url:
             try:
                 r = http_request(session, "GET", jats_url, tries=2, timeout=30)
                 info = parse_jats_last_author(r.content)
+                jats_failures = 0
                 if info and info["affiliations"]:
                     la["affiliations"] = info["affiliations"]
                     la["affiliation_source"] = "full-text XML"
-            except requests.HTTPError as e:
-                code = getattr(e.response, "status_code", None)
-                if code in (401, 403):
-                    log("    full-text XML access is blocked; using corresponding-author data instead")
-                    jats_ok = False
             except (requests.RequestException, ET.ParseError):
-                pass
-            if n % 25 == 0:
-                log(f"    affiliations: {n}/{len(records)}")
+                jats_failures += 1
+                if jats_failures >= 3:
+                    log("    full-text XML isn't reachable from here; skipping it")
+                    jats_ok = False
             time.sleep(0.3)
         if not la["affiliations"] and rec["corresponding_institution"]:
             sur = _surname(la["name"])
             if sur and sur in rec["corresponding_author"].lower():
                 la["affiliations"] = [rec["corresponding_institution"]]
                 la["affiliation_source"] = "bioRxiv metadata (last author is corresponding author)"
+    for rec in records:
+        rec.pop("_jats", None)
+    n_aff = sum(1 for r in records if r["last_author"]["affiliations"])
+    log(f"  last-author affiliation found for {n_aff}/{len(records)} preprints")
     stats["kept"] = len(records)
     return records, stats
 
@@ -462,6 +676,8 @@ def main():
     ap.add_argument("--drop-reviews", action="store_true", help="exclude review articles")
     ap.add_argument("--preprint-min-themes-core", type=int, default=1)
     ap.add_argument("--preprint-min-themes-extended", type=int, default=2)
+    ap.add_argument("--preprint-min-themes-uncategorised", type=int, default=2,
+                    help="threshold when the subject category is unknown (Europe PMC fallback)")
     args = ap.parse_args()
 
     end = args.end or (dt.date.today() - dt.timedelta(days=1))
@@ -477,7 +693,8 @@ def main():
     preprints, pstats = [], None
     if not args.no_preprints:
         preprints, pstats = fetch_preprints(session, start, end, args.preprint_min_themes_core,
-                                            args.preprint_min_themes_extended, not args.no_jats)
+                                            args.preprint_min_themes_extended,
+                                            args.preprint_min_themes_uncategorised, not args.no_jats)
     articles.sort(key=sort_key)
     preprints.sort(key=sort_key)
 
@@ -487,7 +704,7 @@ def main():
         "researcher_interests": list(THEMES),
         "notes": [
             "Journal articles come from PubMed (date = online publication, or date added to PubMed).",
-            "Preprints are new bioRxiv v1 postings, pre-filtered for relevance to the researcher_interests.",
+            "Preprints are new bioRxiv postings (from the bioRxiv API, or Crossref / Europe PMC if bioRxiv blocks the request), pre-filtered for relevance to the researcher_interests.",
             "The last author is usually, but not always, the senior/corresponding author.",
             "relevance.themes is a keyword pre-screen, not a judgement; read the abstract.",
         ],
